@@ -1,0 +1,39 @@
+LuaDecompy-main git:(main) ✗ lua                 
+Lua 5.1.5  Copyright (C) 1994-2012 Lua.org, PUC-Rio
+> 
+➜  LuaDecompy-main git:(main) ✗ 
+➜  LuaDecompy-main git:(main) ✗ lua example.lua.l 
+Hello World!
+➜  LuaDecompy-main git:(main) ✗ luac -o example.luac example.lua  
+➜  LuaDecompy-main git:(main) ✗ lua example.luac                 
+Hello World!
+➜  LuaDecompy-main git:(main) ✗ cat example.lua                                       
+local printMsg = function(append)
+    local tbl = {"He", "llo", " ", "Wo"}
+    local str = ""
+
+    for i = 1, #tbl do
+        str = str .. tbl[i]
+    end
+
+    print(str .. append)
+end
+
+printMsg("rld!")%                                                                                                                                                   
+➜  LuaDecompy-main git:(main) ✗ cat example.luac
+@example.lua$@�\@�rld!
+        J��@�A�b@��@�AA�����������ŀ@A�@�Hello Wo�?print
+appendtblstr
+            (for index)
+
+(for limit)
+
+(for step)
+i
+
+
+
+
+
+        printMsg%                                                                                                                                                   
+➜  LuaDecompy-main git:(main) ✗ 

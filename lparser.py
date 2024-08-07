@@ -8,6 +8,98 @@
 
 from lundump import Chunk, Constant, Instruction, Opcodes, whichRK, readRKasK
 
+
+LUA_STDLIB = {
+    "assert": "global",
+    "collectgarbage": "global",
+    "dofile": "global",
+    "error": "global",
+    "getmetatable": "global",
+    "ipairs": "global",
+    "load": "global",
+    "loadfile": "global",
+    "next": "global",
+    "pairs": "global",
+    "pcall": "global",
+    "print": "global",
+    "rawequal": "global",
+    "rawget": "global",
+    "rawset": "global",
+    "select": "global",
+    "setmetatable": "global",
+    "tonumber": "global",
+    "tostring": "global",
+    "type": "global",
+    "xpcall": "global",
+    "require": "global",
+    "coroutine.create": "coroutine",
+    "coroutine.resume": "coroutine",
+    "coroutine.running": "coroutine",
+    "coroutine.status": "coroutine",
+    "coroutine.wrap": "coroutine",
+    "coroutine.yield": "coroutine",
+    "string.byte": "string",
+    "string.char": "string",
+    "string.dump": "string",
+    "string.find": "string",
+    "string.format": "string",
+    "string.gmatch": "string",
+    "string.gsub": "string",
+    "string.len": "string",
+    "string.lower": "string",
+    "string.match": "string",
+    "string.rep": "string",
+    "string.reverse": "string",
+    "string.sub": "string",
+    "string.upper": "string",
+    "table.concat": "table",
+    "table.insert": "table",
+    "table.remove": "table",
+    "table.sort": "table",
+    "math.abs": "math",
+    "math.acos": "math",
+    "math.asin": "math",
+    "math.atan": "math",
+    "math.ceil": "math",
+    "math.cos": "math",
+    "math.deg": "math",
+    "math.exp": "math",
+    "math.floor": "math",
+    "math.log": "math",
+    "math.max": "math",
+    "math.min": "math",
+    "math.pi": "math",
+    "math.rad": "math",
+    "math.random": "math",
+    "math.randomseed": "math",
+    "math.sin": "math",
+    "math.sqrt": "math",
+    "math.tan": "math",
+    "io.close": "io",
+    "io.flush": "io",
+    "io.input": "io",
+    "io.lines": "io",
+    "io.open": "io",
+    "io.output": "io",
+    "io.popen": "io",
+    "io.read": "io",
+    "io.tmpfile": "io",
+    "io.type": "io",
+    "io.write": "io",
+    "os.clock": "os",
+    "os.date": "os",
+    "os.difftime": "os",
+    "os.execute": "os",
+    "os.exit": "os",
+    "os.getenv": "os",
+    "os.remove": "os",
+    "os.rename": "os",
+    "os.setlocale": "os",
+    "os.time": "os",
+    "os.tmpname": "os",
+}
+
+
 class _Scope:
     def __init__(self, startPC: int, endPC: int):
         self.startPC = startPC
@@ -52,6 +144,10 @@ class LuaDecomp:
         self.scopeOffset = scopeOffset # number of scopes this chunk/proto is in
         self.src: str = ""
 
+        # Add these lines for type inference
+        self.inferred_types = {}
+        self.variable_usage = {}
+
         # configurations!
         self.aggressiveLocals = False # should *EVERY* set register be considered a local? 
         self.annotateLines = False
@@ -64,37 +160,56 @@ class LuaDecomp:
 
             # define params
             for i in range(self.chunk.numParams):
-                # add param to function prototype (also make a local in the register if it doesn't exist)
                 functionProto += ("%s, " if i+1 < self.chunk.numParams else "%s") % self.__makeLocalIdentifier(i)
-
-                # mark local as defined
                 self.__addSetTraceback(i)
             functionProto += ")"
 
             self.__startScope(functionProto, 0, len(self.chunk.instructions))
 
+
         # parse instructions
         while self.pc < len(self.chunk.instructions):
             self.parseInstr()
             self.pc += 1
-
-            # end the scope (if we're supposed too)
             self.__checkScope()
 
-        if not self.headChunk:
+        # Only end the scope if we're not in the head chunk and we have a scope to end
+        if not self.headChunk and self.scope:
             self.__endScope()
+            
+    def __infer_type(self, reg):
+        if reg in self.inferred_types:
+            return self.inferred_types[reg]
+        return "unknown"
+
+    def __set_inferred_type(self, reg, type):
+        self.inferred_types[reg] = type
+
 
     def getPseudoCode(self) -> str:
+        self.__optimize_variable_scopes()
+        
         fullSrc = ""
-
         for line in self.lines:
             if self.annotateLines:
-                fullSrc += "-- PC: %d to PC: %d\n" % (line.startPC, line.endPC)
+                fullSrc += f"-- PC: {line.startPC} to PC: {line.endPC}\n"
             fullSrc += ((' ' * self.indexWidth) * (line.scope + self.scopeOffset)) + line.src + "\n"
 
         return fullSrc
-
     # =======================================[[ Helpers ]]=========================================
+    def __analyze_control_flow(self):
+        self.blocks = []
+        current_block = []
+        for pc, instr in enumerate(self.chunk.instructions):
+            current_block.append((pc, instr))
+            if instr.opcode in [Opcodes.JMP, Opcodes.EQ, Opcodes.LT, Opcodes.LE, Opcodes.TEST, Opcodes.TESTSET, Opcodes.FORLOOP, Opcodes.TFORLOOP]:
+                self.blocks.append(current_block)
+                current_block = []
+        if current_block:
+            self.blocks.append(current_block)
+    def __add_comment(self, comment):
+        self.__addExpr(f"  -- {comment}")
+        self.__endStatement()
 
     def __getInstrAtPC(self, pc: int) -> Instruction:
         if pc < len(self.chunk.instructions):
@@ -167,11 +282,19 @@ class LuaDecomp:
 
     def __getReg(self, indx: int) -> str:
         self.__addUseTraceback(indx)
-
-        # if the top indx is a local, get it
-        return self.locals[indx] if indx in self.locals else self.top[indx]
-
+        if indx in self.locals:
+            return self.locals[indx]
+        elif indx in self.top:
+            return self.top[indx]
+        else:
+            # Handle the case where the register hasn't been initialized
+            # You might want to return a default value or raise a more informative error
+            return f"R[{indx}]"  # or whatever makes sense in your context
     def __setReg(self, indx: int, code: str, forceLocal: bool = False) -> None:
+        if indx not in self.variable_usage:
+            self.variable_usage[indx] = {'first_use': self.pc, 'last_use': self.pc}
+        else:
+            self.variable_usage[indx]['last_use'] = self.pc
         # if the top indx is a local, set it
         if indx in self.locals:
             if self.__needsDefined(indx):
@@ -184,7 +307,26 @@ class LuaDecomp:
 
         self.__addSetTraceback(indx)
         self.top[indx] = code
-
+    def __optimize_variable_scopes(self):
+        for var, usage in self.variable_usage.items():
+            if var in self.locals:
+                local_name = self.locals[var]
+                start_pc = usage['first_use']
+                end_pc = usage['last_use']
+                
+                # Find the appropriate scope for this variable
+                scope_level = 0
+                for block in self.blocks:
+                    if start_pc >= block[0][0] and end_pc <= block[-1][0]:
+                        break
+                    scope_level += 1
+                
+                # Update the local's scope
+                for i, line in enumerate(self.lines):
+                    if line.startPC <= start_pc and line.endPC >= end_pc:
+                        if "local " + local_name in line.src:
+                            self.lines[i].scope = scope_level
+                            break
     # ========================================[[ Locals ]]=========================================
 
     def __makeLocalIdentifier(self, indx: int) -> str:
@@ -211,21 +353,20 @@ class LuaDecomp:
         self.__endStatement()
         self.scope.append(_Scope(start, start + size))
 
-    # checks if we need to end a scope
+        # checks if we need to end a scope
     def __checkScope(self) -> None:
-        if len(self.scope) == 0:
-            return
-
-        if self.pc > self.scope[len(self.scope) - 1].endPC:
+        if self.scope and self.pc > self.scope[-1].endPC:
             self.__endScope()
 
     def __endScope(self) -> None:
-        self.__endStatement()
-        self.__addExpr("end")
-        self.scope.pop()
-
-        self.__endStatement()
-
+        if self.scope:  # Only proceed if there are scopes to end
+            self.__endStatement()
+            self.__addExpr("end")
+            self.scope.pop()
+            self.__endStatement()
+        else:
+            # Optionally, you can add a warning or debug message here
+            print("Warning: Attempted to end scope when no scopes were left.")
     # =====================================[[ Instructions ]]======================================
 
     def __emitOperand(self, a: int, b: str, c: str, op: str) -> None:
@@ -320,14 +461,91 @@ class LuaDecomp:
             self.__setReg(i, v)
 
     def parseInstr(self):
+        if not hasattr(self, 'blocks'):
+            self.__analyze_control_flow()
+        
         instr = self.__getCurrInstr()
-
+        
         match instr.opcode:
             case Opcodes.MOVE: # move is a fake ABC instr, C is ignored
                 # move registers
                 self.__setReg(instr.A, self.__getReg(instr.B))
             case Opcodes.LOADK:
-                self.__setReg(instr.A, self.chunk.getConstant(instr.B).toCode())
+                const = self.chunk.getConstant(instr.B)
+                self.__setReg(instr.A, const.toCode())
+                self.__set_inferred_type(instr.A, const.type.name.lower())
+            case Opcodes.SELF:
+                # SELF is used for method calls (obj:method())
+                # A is the register where the function will be stored
+                # B is the register containing the table (object)
+                # C is the index of the method name (usually a constant)
+                obj = self.__getReg(instr.B)
+                method = self.__readRK(instr.C)
+                self.__setReg(instr.A, f"{obj}:{method}")
+                self.__setReg(instr.A + 1, obj)  # 'self' parameter
+            case Opcodes.TAILCALL:
+                callStr = f"{self.__getReg(instr.A)}("
+                for i in range(instr.A + 1, instr.A + instr.B - 1):
+                    callStr += f"{self.__getReg(i)}, "
+                callStr = callStr.rstrip(", ") + ")"
+                self.__addExpr(f"return {callStr}")
+                self.__endStatement()
+            case Opcodes.SETUPVAL:
+                self.__addExpr(f"upvalue[{instr.B}] = {self.__getReg(instr.A)}")
+                self.__endStatement()
+            case Opcodes.NEWTABLE:
+                self.__parseNewTable(instr.A)
+                self.__add_comment(f"Created new table in R[{instr.A}] with {instr.B} array elements and {instr.C} hash elements")
+            case Opcodes.VARARG:
+                # VARARG handles variable arguments
+                # A is the register where to store the args
+                # B is the number of args wanted (0 means all)
+                if instr.B == 0:
+                    # If B is 0, it means "all remaining arguments"
+                    self.__setReg(instr.A, "...")
+                elif instr.B == 1:
+                    # If B is 1, it means "only one argument"
+                    self.__setReg(instr.A, "select(1, ...)")
+                else:
+                    # If B > 1, it means "B-1 arguments"
+                    args = ", ".join(f"select({i}, ...)" for i in range(1, instr.B))
+                    self.__setReg(instr.A, args)
+                self.__endStatement()
+            case Opcodes.CLOSE:
+                # CLOSE is used to close upvalues
+                # A is the register up to which upvalues should be closed
+                self.__addExpr(f"-- close upvalues up to R[{instr.A}]")
+                self.__endStatement()
+            case Opcodes.TFORLOOP:
+                # TFORLOOP is used in generic for loops
+                # A is the base register of the loop
+                # C is the number of return values
+                self.__addExpr("for ")
+                for i in range(instr.C):
+                    self.__addExpr(self.__getLocal(instr.A + 2 + i))
+                    if i < instr.C - 1:
+                        self.__addExpr(", ")
+                self.__addExpr(" in ")
+                self.__addExpr(self.__getReg(instr.A))
+                self.__startScope(" do", self.pc, instr.B)
+            case Opcodes.LOADNIL:
+                # LOADNIL sets a range of registers to nil
+                # A is the first register to set to nil
+                # B is the last register to set to nil (inclusive)
+                for i in range(instr.A, instr.B + 1):
+                    self.__setReg(i, "nil")
+                self.__endStatement()
+            case Opcodes.TESTSET:
+                # TESTSET is used for conditional assignments
+                # A is the register to set if the test succeeds
+                # B is the register to test
+                # C is the condition (0 = false, 1 = true)
+                condition = "not " if instr.C == 0 else ""
+                test_value = self.__getReg(instr.B)
+                self.__addExpr(f"if {condition}{test_value} then")
+                self.__setReg(instr.A, test_value)
+                self.__endStatement()
+                self.__startScope("", self.pc, 1)  # Start a new scope for the conditional block
             case Opcodes.LOADBOOL:
                 if instr.B == 0:
                     self.__setReg(instr.A, "false")
@@ -343,8 +561,6 @@ class LuaDecomp:
             case Opcodes.SETTABLE:
                 self.__addExpr(self.__getReg(instr.A) + "[" + self.__readRK(instr.B) + "] = " + self.__readRK(instr.C))
                 self.__endStatement()
-            case Opcodes.NEWTABLE:
-                self.__parseNewTable(instr.A)
             case Opcodes.ADD:
                 self.__emitOperand(instr.A, self.__readRK(instr.B), self.__readRK(instr.C), " + ")
             case Opcodes.SUB:
@@ -386,40 +602,73 @@ class LuaDecomp:
                 else:
                     self.__condJmp("not ", False)
             case Opcodes.CALL:
+                func_name = self.__getReg(instr.A)
+                if func_name in LUA_STDLIB:
+                    module = LUA_STDLIB[func_name]
+                    if module != "global":
+                        func_name = f"{module}.{func_name.split('.')[-1]}"
+                    self.__add_comment(f"Calling Lua standard library function: {func_name}")
+                
                 preStr = ""
-                callStr = ""
-                ident = ""
-
+                callStr = f"{func_name}("
+                
                 # parse arguments
-                callStr += self.__getReg(instr.A) + "("
                 for i in range(instr.A + 1, instr.A + instr.B):
-                    callStr += self.__getReg(i) + (", " if not i + 1 == instr.A + instr.B else "")
-                callStr += ")"
+                    callStr += f"{self.__getReg(i)}, "
+                callStr = callStr.rstrip(", ") + ")"
 
                 # parse return values
                 if instr.C > 1:
                     preStr = "local "
-                    for indx  in range(instr.A, instr.A + instr.C - 1):
+                    for indx in range(instr.A, instr.A + instr.C - 1):
                         if indx in self.locals:
                             ident = self.locals[indx]
                         else:
                             ident = self.__makeLocalIdentifier(indx)
                         preStr += ident
-
-                        # normally setReg() does this
                         self.top[indx] = ident
-
-                        # just so we don't have a trailing ', '
                         preStr += ", " if not indx == instr.A + instr.C - 2 else ""
                     preStr += " = "
 
                 self.__addExpr(preStr + callStr)
                 self.__endStatement()
+           
             case Opcodes.RETURN:
+                returnStr = "return "
+                if instr.B == 0:
+                    returnStr += "..."  # Return all results from top
+                elif instr.B > 1:
+                    for i in range(instr.A, instr.A + instr.B - 1):
+                        returnStr += f"{self.__getReg(i)}, "
+                    returnStr = returnStr.rstrip(", ")
+                elif instr.B == 1:
+                    returnStr += self.__getReg(instr.A)
+                self.__addExpr(returnStr)
                 self.__endStatement()
-                pass # no-op for now
             case Opcodes.FORLOOP:
-                pass # no-op for now
+                # This is the loop back point, so we just need to end the scope
+                self.__endScope()
+            case Opcodes.TFORLOOP:
+                # The actual loop body is handled by the previous TFORPREP
+                # Here we just need to check if we should continue the loop
+                self.__addExpr(f"if {self.__getReg(instr.A + 3)} ~= nil then")
+                self.__setReg(instr.A + 2, self.__getReg(instr.A + 3))
+                self.__endStatement()
+                self.__addExpr("else")
+                self.__endStatement()
+                self.__addExpr("  break")
+                self.__endStatement()
+                self.__addExpr("end")
+                self.__endStatement()
+            case Opcodes.VARARG:
+                if instr.B == 0:
+                    self.__setReg(instr.A, "...")
+                elif instr.B == 1:
+                    self.__setReg(instr.A, "select(1, ...)")
+                else:
+                    args = ", ".join(f"select({i}, ...)" for i in range(1, instr.B))
+                    self.__setReg(instr.A, f"{{{args}}}")
+                self.__endStatement()
             case Opcodes.FORPREP:
                 self.__addExpr("for %s = %s, %s, %s " % (self.__getLocal(instr.A+3), self.__getReg(instr.A), self.__getReg(instr.A + 1), self.__getReg(instr.A + 2)))
                 self.__startScope("do", self.pc, instr.B)
@@ -442,5 +691,8 @@ class LuaDecomp:
             case Opcodes.CLOSURE:
                 proto = LuaDecomp(self.chunk.protos[instr.B], headChunk=False, scopeOffset=len(self.scope))
                 self.__setReg(instr.A, proto.getPseudoCode())
+            case Opcodes.GETUPVAL:
+                # Upvalue is retrieved and assigned to a register
+                self.__setReg(instr.A, "upvalue[" + str(instr.B) + "]")
             case _:
                 raise Exception("unsupported instruction: %s" % instr.toString())

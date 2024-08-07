@@ -157,17 +157,14 @@ class Constant:
     # format the constant so that it is parsable by lua
     def toCode(self):
         if self.type == ConstType.STRING:
-            return "\"" + self.data + "\""
+            escaped = self.data.replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            return f'"{escaped}"'
         elif self.type == ConstType.BOOL:
-            if self.data:
-                return "true"
-            else:
-                return "false"
+            return "true" if self.data else "false"
         elif self.type == ConstType.NUMBER:
-            return "%g" % self.data
+            return f"{self.data:g}"
         else:
             return "nil"
-
 class Local:
     def __init__(self, name: str, start: int, end: int):
         self.name = name
